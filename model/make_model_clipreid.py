@@ -234,8 +234,9 @@ class build_transformer(nn.Module):
         text_batch = text_features[labels]  # 👈 bỏ .detach()
 
         q = text_batch.unsqueeze(1)  # [batch, 1, dim]
-        k = image_tokens
-        v = image_tokens
+        # use the projected image tokens so their feature dim matches text/projected dim
+        k = image_features_proj
+        v = image_features_proj
 
         q = self.ln_pre_t(q)
         k = self.ln_pre_i(k)
