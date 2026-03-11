@@ -4,7 +4,8 @@ import numpy as np
 from .clip.simple_tokenizer import SimpleTokenizer as _Tokenizer
 _tokenizer = _Tokenizer()
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
-from torch.nn import LayerNorm
+# from torch.nn import LayerNorm
+from clip.model import Transformer, LayerNorm
 
 def weights_init_kaiming(m):
     classname = m.__class__.__name__
@@ -112,7 +113,13 @@ class build_transformer(nn.Module):
         num_heads = max(1, proj_dim // 64)
         self.cross_attn = nn.MultiheadAttention(proj_dim, num_heads, batch_first=True)
         self.ln_post_cross = LayerNorm(proj_dim)
+        self.ln_pre_t = LayerNorm(proj_dim)
+        self.ln_pre_i = LayerNorm(proj_dim)
 
+        # Transformer nhiều lớp giống cross_former (số layers lấy từ config, mặc định 2)
+        cmt_depth = getattr(cfg.MODEL, 'CMT_DEPTH', 2)
+        self.cross_modal_transformer = Transformer(width=proj_dim, layers=cmt_depth, heads=num_heads)
+        
     def forward(self, x = None, label=None, get_image = False, get_text = False, cam_label= None, view_label=None):
         if get_text == True:
             prompts = self.prompt_learner(label) 
@@ -161,19 +168,54 @@ class build_transformer(nn.Module):
             else:
                 return torch.cat([img_feature, img_feature_proj], dim=1)
 
-    def adapt_text_with_image(self, text_features, images, labels=None, cam_label=None, view_label=None):
-        """
-        Adapt text features by applying cross-attention with image tokens.
-        - `text_features`: Tensor[num_classes, dim]
-        - `images`: Tensor[batch, C, H, W]
-        - `labels`: Tensor[batch] with class indices to adapt (required)
+    # def adapt_text_with_image(self, text_features, images, labels=None, cam_label=None, view_label=None):
+    #     """
+    #     Adapt text features by applying cross-attention with image tokens.
+    #     - `text_features`: Tensor[num_classes, dim]
+    #     - `images`: Tensor[batch, C, H, W]
+    #     - `labels`: Tensor[batch] with class indices to adapt (required)
 
-        Returns: Tensor[batch, dim] adapted text vectors for the provided `labels` (no grad)
-        """
+    #     Returns: Tensor[batch, dim] adapted text vectors for the provided `labels` (no grad)
+    #     """
+    #     if labels is None:
+    #         raise ValueError('labels must be provided to adapt_text_with_image')
+
+    #     # get image token features from visual encoder
+    #     if self.model_name == 'ViT-B-16':
+    #         if cam_label is not None and view_label is not None:
+    #             cv_embed = self.sie_coe * self.cv_embed[cam_label * self.view_num + view_label]
+    #         elif cam_label is not None:
+    #             cv_embed = self.sie_coe * self.cv_embed[cam_label]
+    #         elif view_label is not None:
+    #             cv_embed = self.sie_coe * self.cv_embed[view_label]
+    #         else:
+    #             cv_embed = None
+    #         image_features_last, image_tokens, image_features_proj = self.image_encoder(images, cv_embed)
+    #     else:
+    #         image_features_last, image_tokens, image_features_proj = self.image_encoder(images)
+
+    #     # image_tokens: [batch, seq_len, dim]
+    #     # select text vectors for this batch
+    #     device = images.device
+    #     text_features = text_features.to(device)
+
+    #     # Detach the precomputed text vectors so gradients do NOT flow back to them
+    #     # but still allow gradients to flow into the MultiheadAttention parameters.
+    #     text_batch = text_features[labels].detach()
+    #     # q: [batch, 1, dim]
+    #     q = text_batch.unsqueeze(1)
+    #     k = image_tokens
+    #     v = image_tokens
+    #     x = self.cross_attn(q, k, v, need_weights=False)[0]
+    #     x = x.squeeze(1)
+    #     x = self.ln_post_cross(x)
+
+    #     return x
+    def adapt_text_with_image(self, text_features, images, labels=None, cam_label=None, view_label=None):
         if labels is None:
             raise ValueError('labels must be provided to adapt_text_with_image')
 
-        # get image token features from visual encoder
+        # Lấy image tokens
         if self.model_name == 'ViT-B-16':
             if cam_label is not None and view_label is not None:
                 cv_embed = self.sie_coe * self.cv_embed[cam_label * self.view_num + view_label]
@@ -187,25 +229,33 @@ class build_transformer(nn.Module):
         else:
             image_features_last, image_tokens, image_features_proj = self.image_encoder(images)
 
-        # image_tokens: [batch, seq_len, dim]
-        # select text vectors for this batch
         device = images.device
         text_features = text_features.to(device)
+        text_batch = text_features[labels]  # 👈 bỏ .detach()
 
-        # Detach the precomputed text vectors so gradients do NOT flow back to them
-        # but still allow gradients to flow into the MultiheadAttention parameters.
-        text_batch = text_features[labels].detach()
-        # q: [batch, 1, dim]
-        q = text_batch.unsqueeze(1)
+        q = text_batch.unsqueeze(1)  # [batch, 1, dim]
         k = image_tokens
         v = image_tokens
-        x = self.cross_attn(q, k, v, need_weights=False)[0]
-        x = x.squeeze(1)
-        x = self.ln_post_cross(x)
 
-        return x
+        q = self.ln_pre_t(q)
+        k = self.ln_pre_i(k)
+        v = self.ln_pre_i(v)
 
+        x = self.cross_attn(q, k, v, need_weights=False)[0]  # [batch, 1, dim]
 
+        x = x.permute(1, 0, 2)  # [1, batch, dim]
+
+        outputs = self.cross_modal_transformer(x)
+        if isinstance(outputs, (list, tuple)):
+            x = outputs[0]
+        else:
+            x = outputs
+
+        x = x.permute(1, 0, 2)  # [batch, 1, dim]
+        x = self.ln_post_cross(x)  # 
+
+        return x  # shape [batch, 1, dim]
+    
     def load_param(self, trained_path):
         param_dict = torch.load(trained_path)
         for i in param_dict:
