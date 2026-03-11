@@ -5,7 +5,7 @@ from .clip.simple_tokenizer import SimpleTokenizer as _Tokenizer
 _tokenizer = _Tokenizer()
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 # from torch.nn import LayerNorm
-from clip.model import Transformer, LayerNorm
+from .clip.model import Transformer, LayerNorm
 
 def weights_init_kaiming(m):
     classname = m.__class__.__name__
