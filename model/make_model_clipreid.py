@@ -255,7 +255,8 @@ class build_transformer(nn.Module):
         x = x.permute(1, 0, 2)  # [batch, 1, dim]
         x = self.ln_post_cross(x)  # 
 
-        return x  # shape [batch, 1, dim]
+        # squeeze the sequence dim so output shape is [batch, dim]
+        return x.squeeze(1)  # shape [batch, dim]
     
     def load_param(self, trained_path):
         param_dict = torch.load(trained_path)
