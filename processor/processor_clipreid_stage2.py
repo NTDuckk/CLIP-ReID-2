@@ -84,7 +84,7 @@ def do_train_stage2(cfg,
             optimizer.zero_grad()
             optimizer_center.zero_grad()
             img = img.to(device)
-            target = vid.to(device)
+            target = vid.squeeze().to(device)
             if cfg.MODEL.SIE_CAMERA:
                 target_cam = target_cam.to(device)
             else: 
