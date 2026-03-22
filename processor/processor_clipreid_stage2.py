@@ -19,7 +19,8 @@ def do_train_stage2(cfg,
              optimizer_center,
              scheduler,
              loss_fn,
-             num_query, local_rank):
+             num_query, local_rank,
+             precomputed_text_features=None):
     log_period = cfg.SOLVER.STAGE2.LOG_PERIOD
     checkpoint_period = cfg.SOLVER.STAGE2.CHECKPOINT_PERIOD
     eval_period = cfg.SOLVER.STAGE2.EVAL_PERIOD
@@ -52,24 +53,27 @@ def do_train_stage2(cfg,
     from datetime import timedelta
     all_start_time = time.monotonic()
 
-    # train
-    batch = cfg.SOLVER.STAGE2.IMS_PER_BATCH
-    i_ter = num_classes // batch
-    left = num_classes-batch* (num_classes//batch)
-    if left != 0 :
-        i_ter = i_ter+1
-    text_features = []
-    with torch.no_grad():
-        for i in range(i_ter):
-            if i+1 != i_ter:
-                l_list = torch.arange(i*batch, (i+1)* batch)
-            else:
-                l_list = torch.arange(i*batch, num_classes)
-            with amp.autocast(enabled=True):
-                text_feature = model(label = l_list, get_text = True)
-            text_features.append(text_feature.cpu())
-        text_features = torch.cat(text_features, 0).cuda()
-
+    # Use pre-computed text features from Stage 1 inversion, or compute from PromptLearner
+    if precomputed_text_features is not None:
+        text_features = precomputed_text_features.cuda()
+        logger.info("Using pre-computed text features from Stage 1 inversion, shape: {}".format(text_features.shape))
+    else:
+        batch = cfg.SOLVER.STAGE2.IMS_PER_BATCH
+        i_ter = num_classes // batch
+        left = num_classes-batch* (num_classes//batch)
+        if left != 0 :
+            i_ter = i_ter+1
+        text_features = []
+        with torch.no_grad():
+            for i in range(i_ter):
+                if i+1 != i_ter:
+                    l_list = torch.arange(i*batch, (i+1)* batch)
+                else:
+                    l_list = torch.arange(i*batch, num_classes)
+                with amp.autocast(enabled=True):
+                    text_feature = model(label = l_list, get_text = True)
+                text_features.append(text_feature.cpu())
+            text_features = torch.cat(text_features, 0).cuda()
 
     for epoch in range(1, epochs + 1):
         start_time = time.time()
@@ -84,7 +88,7 @@ def do_train_stage2(cfg,
             optimizer.zero_grad()
             optimizer_center.zero_grad()
             img = img.to(device)
-            target = vid.squeeze().to(device)
+            target = vid.to(device)
             if cfg.MODEL.SIE_CAMERA:
                 target_cam = target_cam.to(device)
             else: 
@@ -95,21 +99,7 @@ def do_train_stage2(cfg,
                 target_view = None
             with amp.autocast(enabled=True):
                 score, feat, image_features = model(x = img, label = target, cam_label=target_cam, view_label=target_view)
-                # Adapt precomputed text features with cross-attention using current batch images.
-                # This adaptation uses no grad inside the model method.
-                # Work on a copy of the full text_features and replace rows corresponding to this batch's labels.
-                text_features = text_features.to(img.device)
-                text_features_batch = text_features.clone()
-                # call adapt_text_with_image (handle DataParallel model.module if present)
-                if hasattr(model, 'module'):
-                    adapted = model.module.adapt_text_with_image(text_features, img, labels=target, cam_label=target_cam, view_label=target_view)
-                else:
-                    adapted = model.adapt_text_with_image(text_features, img, labels=target, cam_label=target_cam, view_label=target_view)
-
-                # write adapted vectors back into the working text matrix for corresponding labels
-                text_features_batch[target] = adapted
-
-                logits = image_features @ text_features_batch.t()
+                logits = image_features @ text_features.t()
                 loss = loss_fn(score, feat, target, target_cam, logits)
 
             scaler.scale(loss).backward()

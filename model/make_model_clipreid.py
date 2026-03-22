@@ -4,8 +4,6 @@ import numpy as np
 from .clip.simple_tokenizer import SimpleTokenizer as _Tokenizer
 _tokenizer = _Tokenizer()
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
-# from torch.nn import LayerNorm
-from .clip.model import Transformer, LayerNorm
 
 def weights_init_kaiming(m):
     classname = m.__class__.__name__
@@ -49,6 +47,7 @@ class TextEncoder(nn.Module):
         # x.shape = [batch_size, n_ctx, transformer.width]
         # take features from the eot embedding (eot_token is the highest number in each sequence)
         # x = x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)] @ self.text_projection 
+        
         x = x[torch.arange(x.shape[0], device=x.device), tokenized_prompts.argmax(dim=-1).to(x.device)] @ self.text_projection 
         return x
 
@@ -105,22 +104,18 @@ class build_transformer(nn.Module):
 
         dataset_name = cfg.DATASETS.NAMES
         self.prompt_learner = PromptLearner(num_classes, dataset_name, clip_model.dtype, clip_model.token_embedding)
+        self.inversion_prompt_learner = InversionPromptLearner(
+            dataset_name, clip_model.dtype, clip_model.token_embedding,
+            clip_proj_dim=self.in_planes_proj
+        )
         self.text_encoder = TextEncoder(clip_model)
 
-        # cross-attention modules to adapt text features with image tokens
-        # use projection dimension so text & image proj dims match
-        proj_dim = self.in_planes_proj
-        num_heads = max(1, proj_dim // 64)
-        self.cross_attn = nn.MultiheadAttention(proj_dim, num_heads, batch_first=True)
-        self.ln_post_cross = LayerNorm(proj_dim)
-        self.ln_pre_t = LayerNorm(proj_dim)
-        self.ln_pre_i = LayerNorm(proj_dim)
+    def forward(self, x = None, label=None, get_image = False, get_text = False, get_text_from_image = False, image_features_for_inversion = None, cam_label= None, view_label=None):
+        if get_text_from_image == True:
+            prompts = self.inversion_prompt_learner(image_features_for_inversion)
+            text_features = self.text_encoder(prompts, self.inversion_prompt_learner.tokenized_prompts)
+            return text_features
 
-        # Transformer nhiều lớp giống cross_former (số layers lấy từ config, mặc định 2)
-        cmt_depth = getattr(cfg.MODEL, 'CMT_DEPTH', 2)
-        self.cross_modal_transformer = Transformer(width=proj_dim, layers=cmt_depth, heads=num_heads)
-        
-    def forward(self, x = None, label=None, get_image = False, get_text = False, cam_label= None, view_label=None):
         if get_text == True:
             prompts = self.prompt_learner(label) 
             text_features = self.text_encoder(prompts, self.prompt_learner.tokenized_prompts)
@@ -168,96 +163,7 @@ class build_transformer(nn.Module):
             else:
                 return torch.cat([img_feature, img_feature_proj], dim=1)
 
-    # def adapt_text_with_image(self, text_features, images, labels=None, cam_label=None, view_label=None):
-    #     """
-    #     Adapt text features by applying cross-attention with image tokens.
-    #     - `text_features`: Tensor[num_classes, dim]
-    #     - `images`: Tensor[batch, C, H, W]
-    #     - `labels`: Tensor[batch] with class indices to adapt (required)
 
-    #     Returns: Tensor[batch, dim] adapted text vectors for the provided `labels` (no grad)
-    #     """
-    #     if labels is None:
-    #         raise ValueError('labels must be provided to adapt_text_with_image')
-
-    #     # get image token features from visual encoder
-    #     if self.model_name == 'ViT-B-16':
-    #         if cam_label is not None and view_label is not None:
-    #             cv_embed = self.sie_coe * self.cv_embed[cam_label * self.view_num + view_label]
-    #         elif cam_label is not None:
-    #             cv_embed = self.sie_coe * self.cv_embed[cam_label]
-    #         elif view_label is not None:
-    #             cv_embed = self.sie_coe * self.cv_embed[view_label]
-    #         else:
-    #             cv_embed = None
-    #         image_features_last, image_tokens, image_features_proj = self.image_encoder(images, cv_embed)
-    #     else:
-    #         image_features_last, image_tokens, image_features_proj = self.image_encoder(images)
-
-    #     # image_tokens: [batch, seq_len, dim]
-    #     # select text vectors for this batch
-    #     device = images.device
-    #     text_features = text_features.to(device)
-
-    #     # Detach the precomputed text vectors so gradients do NOT flow back to them
-    #     # but still allow gradients to flow into the MultiheadAttention parameters.
-    #     text_batch = text_features[labels].detach()
-    #     # q: [batch, 1, dim]
-    #     q = text_batch.unsqueeze(1)
-    #     k = image_tokens
-    #     v = image_tokens
-    #     x = self.cross_attn(q, k, v, need_weights=False)[0]
-    #     x = x.squeeze(1)
-    #     x = self.ln_post_cross(x)
-
-    #     return x
-    def adapt_text_with_image(self, text_features, images, labels=None, cam_label=None, view_label=None):
-        if labels is None:
-            raise ValueError('labels must be provided to adapt_text_with_image')
-
-        # Lấy image tokens
-        if self.model_name == 'ViT-B-16':
-            if cam_label is not None and view_label is not None:
-                cv_embed = self.sie_coe * self.cv_embed[cam_label * self.view_num + view_label]
-            elif cam_label is not None:
-                cv_embed = self.sie_coe * self.cv_embed[cam_label]
-            elif view_label is not None:
-                cv_embed = self.sie_coe * self.cv_embed[view_label]
-            else:
-                cv_embed = None
-            image_features_last, image_tokens, image_features_proj = self.image_encoder(images, cv_embed)
-        else:
-            image_features_last, image_tokens, image_features_proj = self.image_encoder(images)
-
-        device = images.device
-        text_features = text_features.to(device)
-        text_batch = text_features[labels]  # 👈 bỏ .detach()
-
-        q = text_batch.unsqueeze(1)  # [batch, 1, dim]
-        # use the projected image tokens so their feature dim matches text/projected dim
-        k = image_features_proj
-        v = image_features_proj
-
-        q = self.ln_pre_t(q)
-        k = self.ln_pre_i(k)
-        v = self.ln_pre_i(v)
-
-        x = self.cross_attn(q, k, v, need_weights=False)[0]  # [batch, 1, dim]
-
-        x = x.permute(1, 0, 2)  # [1, batch, dim]
-
-        outputs = self.cross_modal_transformer(x)
-        if isinstance(outputs, (list, tuple)):
-            x = outputs[0]
-        else:
-            x = outputs
-
-        x = x.permute(1, 0, 2)  # [batch, 1, dim]
-        x = self.ln_post_cross(x)  # 
-
-        # squeeze the sequence dim so output shape is [batch, dim]
-        return x.squeeze(1)  # shape [batch, dim]
-    
     def load_param(self, trained_path):
         param_dict = torch.load(trained_path)
         for i in param_dict:
@@ -292,6 +198,64 @@ def load_clip_to_cpu(backbone_name, h_resolution, w_resolution, vision_stride_si
     model = clip.build_model(state_dict or model.state_dict(), h_resolution, w_resolution, vision_stride_size)
 
     return model
+
+class InversionPromptLearner(nn.Module):
+    """AP-Attack inspired textual inversion: 5 MLP networks map image features to pseudo-tokens."""
+    def __init__(self, dataset_name, dtype, token_embedding, clip_proj_dim=512):
+        super().__init__()
+        if dataset_name == "VehicleID" or dataset_name == "veri":
+            template = "A photo of a vehicle with X body , X color , X type , X top , carrying X ."
+        else:
+            template = "A photo of a person wearing X on top , X underneath , X hairstyle , X shoes , carrying X ."
+
+        self.num_attributes = 5
+
+        tokenized_prompts = clip.tokenize(template).cuda()
+        with torch.no_grad():
+            embedding = token_embedding(tokenized_prompts).type(dtype)
+
+        self.tokenized_prompts = tokenized_prompts  # [1, 77]
+
+        # Find positions of X placeholder tokens
+        x_token_id = clip.tokenize("X")[0, 1].item()
+        x_positions = (tokenized_prompts[0] == x_token_id).nonzero(as_tuple=False).view(-1)
+        assert x_positions.shape[0] == self.num_attributes, \
+            "Expected {} X positions in template, got {}".format(self.num_attributes, x_positions.shape[0])
+
+        self.register_buffer("template_embedding", embedding)  # [1, 77, ctx_dim]
+        self.register_buffer("x_positions", x_positions)       # [num_attributes]
+        self.dtype = dtype
+
+        ctx_dim = embedding.shape[-1]  # 512
+        hidden_dim = 1024
+
+        # 5 three-layer MLP inversion networks (shared across all IDs)
+        self.inversion_nets = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(clip_proj_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, ctx_dim),
+            ) for _ in range(self.num_attributes)
+        ])
+
+    def forward(self, image_features):
+        """
+        Args:
+            image_features: [B, clip_proj_dim] projected CLS features from frozen image encoder
+        Returns:
+            prompts: [B, 77, ctx_dim] prompt embeddings with pseudo-tokens inserted
+        """
+        B = image_features.shape[0]
+        prompts = self.template_embedding.expand(B, -1, -1).clone()
+
+        for i, net in enumerate(self.inversion_nets):
+            pseudo_token = net(image_features.float())  # [B, ctx_dim]
+            prompts[:, self.x_positions[i], :] = pseudo_token.type(self.dtype)
+
+        return prompts
+
 
 class PromptLearner(nn.Module):
     def __init__(self, num_class, dataset_name, dtype, token_embedding):

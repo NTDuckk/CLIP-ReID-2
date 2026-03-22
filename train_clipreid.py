@@ -73,7 +73,7 @@ if __name__ == '__main__':
     scheduler_1stage = create_scheduler(optimizer_1stage, num_epochs = cfg.SOLVER.STAGE1.MAX_EPOCHS, lr_min = cfg.SOLVER.STAGE1.LR_MIN, \
                         warmup_lr_init = cfg.SOLVER.STAGE1.WARMUP_LR_INIT, warmup_t = cfg.SOLVER.STAGE1.WARMUP_EPOCHS, noise_range = None)
 
-    do_train_stage1(
+    text_features = do_train_stage1(
         cfg,
         model,
         train_loader_stage1,
@@ -96,5 +96,6 @@ if __name__ == '__main__':
         optimizer_center_2stage,
         scheduler_2stage,
         loss_func,
-        num_query, args.local_rank
+        num_query, args.local_rank,
+        precomputed_text_features=text_features
     )
